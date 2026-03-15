@@ -20,7 +20,7 @@ jobs:
   # Mirrors: select-sbx in sandbox-deploy-control-plane.yml
   # ─────────────────────────────────────────────────────────────────
   extract-pr-info:
-    runs-on: general-small
+    runs-on: ubuntu-latest
     outputs:
       jira-ticket:  ${{ steps.parse.outputs.jira-ticket }}
       namespace:    ${{ steps.parse.outputs.namespace }}
