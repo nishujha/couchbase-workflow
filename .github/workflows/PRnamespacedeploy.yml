@@ -1,0 +1,471 @@
+name: pr/namespace-deploy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+# Prevent parallel deploys for the same PR.
+# If a new push comes in while a deploy is running, cancel the in-progress run
+# and start fresh — same behaviour as the sandbox workflow being re-triggered.
+concurrency:
+  group: pr-namespace-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────
+  # Extract PR metadata (JIRA ticket, namespace name, image tag)
+  # Mirrors: select-sbx in sandbox-deploy-control-plane.yml
+  # ─────────────────────────────────────────────────────────────────
+  extract-pr-info:
+    runs-on: general-small
+    outputs:
+      jira-ticket:  ${{ steps.parse.outputs.jira-ticket }}
+      namespace:    ${{ steps.parse.outputs.namespace }}
+      image-tag:    ${{ steps.parse.outputs.image-tag }}
+      base-path:    ${{ steps.parse.outputs.base-path }}
+      pr-url:       ${{ github.event.pull_request.html_url }}
+    steps:
+      # actions/checkout@v4.0.0
+      - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+        name: Checkout
+        id: checkout
+
+      - name: Parse PR metadata
+        id: parse
+        run: |
+          # Extract AV-XXXXX from branch name, PR title, or commit message.
+          # Priority: branch name first, then PR title.
+          BRANCH="${{ github.head_ref }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+
+          JIRA=$(echo "$BRANCH" | grep -oP 'AV-\d+' | head -1)
+          if [ -z "$JIRA" ]; then
+            JIRA=$(echo "$PR_TITLE" | grep -oP 'AV-\d+' | head -1)
+          fi
+
+          if [ -z "$JIRA" ]; then
+            echo "::error::Could not extract a JIRA ticket (AV-XXXXX) from branch '$BRANCH' or PR title '$PR_TITLE'."
+            echo "::error::Rename your branch or PR title to include the ticket, e.g. AV-12345-my-feature."
+            exit 1
+          fi
+
+          # Namespace: av-12345  (lowercase, strip "AV-" prefix)
+          TICKET_NUMBER="${JIRA#AV-}"
+          NAMESPACE="av-${TICKET_NUMBER,,}"
+
+          # Image tag: use the head SHA so every push deploys the right image
+          IMAGE_TAG="${{ github.event.pull_request.head.sha }}"
+
+          echo "jira-ticket=$JIRA"          >> $GITHUB_OUTPUT
+          echo "namespace=$NAMESPACE"       >> $GITHUB_OUTPUT
+          echo "image-tag=$IMAGE_TAG"       >> $GITHUB_OUTPUT
+          echo "base-path=/$JIRA"           >> $GITHUB_OUTPUT
+
+          echo "JIRA Ticket : $JIRA"
+          echo "Namespace   : $NAMESPACE"
+          echo "Image Tag   : $IMAGE_TAG"
+          echo "Base Path   : /$JIRA"
+
+  # ─────────────────────────────────────────────────────────────────
+  # Print a workflow summary (mirrors the summary job in sandbox workflow)
+  # ─────────────────────────────────────────────────────────────────
+  summary:
+    needs: [extract-pr-info]
+    runs-on: general-small
+    steps:
+      # actions/checkout@v4.0.0
+      - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+        name: Checkout
+        id: checkout
+      - uses: ./.github/actions/workflow-summary
+        name: Report Summary (${{ needs.extract-pr-info.outputs.namespace }})
+
+  # ─────────────────────────────────────────────────────────────────
+  # Create the Kubernetes namespace + resource quotas + limit ranges.
+  # Mirrors: deploy-kubernetes in sandbox workflow (but namespace-scoped).
+  # Idempotent — safe to re-run on every push to the PR.
+  # ─────────────────────────────────────────────────────────────────
+  create-namespace:
+    runs-on: general-small
+    needs: [extract-pr-info]
+    env:
+      NAMESPACE: ${{ needs.extract-pr-info.outputs.namespace }}
+      JIRA_TICKET: ${{ needs.extract-pr-info.outputs.jira-ticket }}
+    steps:
+      # actions/checkout@v4.0.0
+      - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+        name: Checkout
+        id: checkout
+
+      # aws-actions/configure-aws-credentials@v4.0.0
+      - uses: aws-actions/configure-aws-credentials@8c3f20df09ac63af7b3ae3d7c91f105f857d8497
+        name: Configure AWS credentials
+        with:
+          role-to-assume: arn:aws:iam::264138468394:role/spinnaker-terraformer-role
+          aws-region: us-east-1
+          role-skip-session-tagging: true
+          role-chaining: true
+
+      # azure/setup-kubectl@v4
+      - uses: azure/setup-kubectl@3e0aec4d80787158d308d7b364cb1b702e7feb7f
+        name: Setup Kubectl
+        id: kubectl
+        with:
+          version: latest
+
+      - name: Configure kubeconfig for PR-testing cluster
+        run: |
+          aws eks update-kubeconfig \
+            --name pr-testing-automode \
+            --region us-east-1
+
+      - name: Create or update namespace
+        run: |
+          # --dry-run + apply makes this idempotent
+          kubectl create namespace "$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Label and annotate namespace
+        run: |
+          kubectl label namespace "$NAMESPACE" \
+            app.kubernetes.io/managed-by=pr-automation \
+            pr-number="${{ github.event.pull_request.number }}" \
+            jira-ticket="$JIRA_TICKET" \
+            environment=pr-testing \
+            --overwrite
+
+          kubectl annotate namespace "$NAMESPACE" \
+            pr-url="${{ github.event.pull_request.html_url }}" \
+            pr-title="${{ github.event.pull_request.title }}" \
+            pr-author="${{ github.event.pull_request.user.login }}" \
+            created-at="$(date -u -Iseconds)" \
+            expires-at="$(date -u -d '+48 hours' -Iseconds)" \
+            --overwrite
+
+      - name: Apply ResourceQuota
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: pr-quota
+            namespace: $NAMESPACE
+          spec:
+            hard:
+              requests.cpu: "20"
+              requests.memory: "40Gi"
+              limits.cpu: "40"
+              limits.memory: "80Gi"
+              persistentvolumeclaims: "10"
+              services.loadbalancers: "0"
+              count/deployments.apps: "25"
+              count/services: "25"
+              count/configmaps: "20"
+              count/secrets: "20"
+          EOF
+
+      - name: Apply LimitRange
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: LimitRange
+          metadata:
+            name: pr-limits
+            namespace: $NAMESPACE
+          spec:
+            limits:
+            - type: Container
+              max:
+                cpu: "8"
+                memory: "16Gi"
+              min:
+                cpu: "10m"
+                memory: "64Mi"
+              default:
+                cpu: "500m"
+                memory: "512Mi"
+              defaultRequest:
+                cpu: "100m"
+                memory: "128Mi"
+          EOF
+
+  # ─────────────────────────────────────────────────────────────────
+  # Provision Couchbase bucket + credentials scoped to this namespace.
+  # Mirrors: deploy-data in sandbox workflow (lightweight — operator
+  # and cluster are already running on the shared cluster).
+  # ─────────────────────────────────────────────────────────────────
+  deploy-data:
+    runs-on: general-small
+    needs: [extract-pr-info, create-namespace]
+    steps:
+      # actions/checkout@v4.0.0
+      - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+        name: Checkout
+        id: checkout
+
+      # hashicorp/setup-terraform@v3.0.0
+      - uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36
+        name: Setup Terraform
+        id: setup
+        with:
+          terraform_wrapper: false
+          terraform_version: 1.13.3
+
+      # aws-actions/configure-aws-credentials@v4.0.0
+      - uses: aws-actions/configure-aws-credentials@8c3f20df09ac63af7b3ae3d7c91f105f857d8497
+        name: Configure AWS credentials
+        with:
+          role-to-assume: arn:aws:iam::264138468394:role/spinnaker-terraformer-role
+          aws-region: us-east-1
+          role-skip-session-tagging: true
+          role-chaining: true
+
+      # Attempt 1
+      - uses: ./.github/actions/sandbox-apply
+        name: Data Services (Attempt 1)
+        id: data-attempt1
+        continue-on-error: true
+        with:
+          cloud-id: ${{ needs.extract-pr-info.outputs.namespace }}
+          working-directory: ./terraform/live/controlplane/pr-testing/data
+          tf-workspace: ${{ needs.extract-pr-info.outputs.namespace }}-data
+          tf-var-with-tags: true
+
+      - name: Wait before retry (Data)
+        if: ${{ steps.data-attempt1.outcome == 'failure' }}
+        run: sleep 30
+
+      # Attempt 2
+      - uses: ./.github/actions/sandbox-apply
+        if: ${{ steps.data-attempt1.outcome == 'failure' }}
+        name: Data Services (Attempt 2)
+        id: data-attempt2
+        with:
+          cloud-id: ${{ needs.extract-pr-info.outputs.namespace }}
+          working-directory: ./terraform/live/controlplane/pr-testing/data
+          tf-workspace: ${{ needs.extract-pr-info.outputs.namespace }}-data
+          tf-var-with-tags: true
+
+      - name: Check Data deployment status
+        if: ${{ steps.data-attempt1.outcome == 'failure' && steps.data-attempt2.outcome == 'failure' }}
+        run: |
+          echo "Data Services deployment failed after 2 attempts"
+          exit 1
+
+  # ─────────────────────────────────────────────────────────────────
+  # Deploy all control plane applications into the PR namespace.
+  # Mirrors: deploy-applications in sandbox workflow.
+  # Uses Terraform workspace-per-PR so state is isolated.
+  # ─────────────────────────────────────────────────────────────────
+  deploy-applications:
+    runs-on: general-small
+    needs: [extract-pr-info, deploy-data]
+    steps:
+      # actions/checkout@v4.0.0
+      - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+        name: Checkout
+        id: checkout
+
+      # hashicorp/setup-terraform@v3.0.0
+      - uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36
+        name: Setup Terraform
+        id: setup
+        with:
+          terraform_wrapper: false
+          terraform_version: 1.13.3
+
+      # aws-actions/configure-aws-credentials@v4.0.0
+      - uses: aws-actions/configure-aws-credentials@8c3f20df09ac63af7b3ae3d7c91f105f857d8497
+        name: Configure AWS credentials
+        with:
+          role-to-assume: arn:aws:iam::264138468394:role/spinnaker-terraformer-role
+          aws-region: us-east-1
+          role-skip-session-tagging: true
+          role-chaining: true
+
+      # Attempt 1
+      - uses: ./.github/actions/sandbox-apply
+        name: Applications (Attempt 1)
+        id: applications-attempt1
+        continue-on-error: true
+        with:
+          cloud-id: ${{ needs.extract-pr-info.outputs.namespace }}
+          working-directory: ./terraform/live/controlplane/pr-testing/applications
+          tf-workspace: ${{ needs.extract-pr-info.outputs.namespace }}-applications
+          tf-var-image-tag: ${{ needs.extract-pr-info.outputs.image-tag }}
+          # Extra vars consumed by the pr-testing application modules
+          tf-extra-vars: |
+            pr_namespace=${{ needs.extract-pr-info.outputs.namespace }}
+            pr_number=${{ github.event.pull_request.number }}
+            jira_ticket=${{ needs.extract-pr-info.outputs.jira-ticket }}
+            base_path=${{ needs.extract-pr-info.outputs.base-path }}
+
+      - name: Wait before retry (Applications)
+        if: ${{ steps.applications-attempt1.outcome == 'failure' }}
+        run: sleep 30
+
+      # Attempt 2
+      - uses: ./.github/actions/sandbox-apply
+        if: ${{ steps.applications-attempt1.outcome == 'failure' }}
+        name: Applications (Attempt 2)
+        id: applications-attempt2
+        continue-on-error: true
+        with:
+          cloud-id: ${{ needs.extract-pr-info.outputs.namespace }}
+          working-directory: ./terraform/live/controlplane/pr-testing/applications
+          tf-workspace: ${{ needs.extract-pr-info.outputs.namespace }}-applications
+          tf-var-image-tag: ${{ needs.extract-pr-info.outputs.image-tag }}
+          tf-extra-vars: |
+            pr_namespace=${{ needs.extract-pr-info.outputs.namespace }}
+            pr_number=${{ github.event.pull_request.number }}
+            jira_ticket=${{ needs.extract-pr-info.outputs.jira-ticket }}
+            base_path=${{ needs.extract-pr-info.outputs.base-path }}
+
+      - name: Wait before final retry (Applications)
+        if: ${{ steps.applications-attempt1.outcome == 'failure' && steps.applications-attempt2.outcome == 'failure' }}
+        run: sleep 30
+
+      # Final attempt — matches core's 3-attempt pattern since this is the most critical step
+      - uses: ./.github/actions/sandbox-apply
+        if: ${{ steps.applications-attempt1.outcome == 'failure' && steps.applications-attempt2.outcome == 'failure' }}
+        name: Applications (Final Attempt)
+        id: applications-final
+        with:
+          cloud-id: ${{ needs.extract-pr-info.outputs.namespace }}
+          working-directory: ./terraform/live/controlplane/pr-testing/applications
+          tf-workspace: ${{ needs.extract-pr-info.outputs.namespace }}-applications
+          tf-var-image-tag: ${{ needs.extract-pr-info.outputs.image-tag }}
+          tf-extra-vars: |
+            pr_namespace=${{ needs.extract-pr-info.outputs.namespace }}
+            pr_number=${{ github.event.pull_request.number }}
+            jira_ticket=${{ needs.extract-pr-info.outputs.jira-ticket }}
+            base_path=${{ needs.extract-pr-info.outputs.base-path }}
+
+      - name: Check Applications deployment status
+        if: >-
+          ${{
+            steps.applications-attempt1.outcome == 'failure' &&
+            steps.applications-attempt2.outcome == 'failure' &&
+            steps.applications-final.outcome == 'failure'
+          }}
+        run: |
+          echo "Applications deployment failed after 3 attempts"
+          exit 1
+
+  # ─────────────────────────────────────────────────────────────────
+  # Print workflow summary + post a PR comment with the live endpoints.
+  # Mirrors: output-summary in sandbox workflow.
+  # ─────────────────────────────────────────────────────────────────
+  output-summary:
+    runs-on: general-small
+    needs: [extract-pr-info, deploy-applications]
+    steps:
+      - name: Output Summary
+        run: |
+          NAMESPACE="${{ needs.extract-pr-info.outputs.namespace }}"
+          JIRA="${{ needs.extract-pr-info.outputs.jira-ticket }}"
+          BASE="https://pr-testing.sandbox.nonprod-project-avengers.com/${JIRA}"
+
+          echo "### PR Environment Deployed 🚀" | tee -a $GITHUB_STEP_SUMMARY
+          echo ""                               | tee -a $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |"               | tee -a $GITHUB_STEP_SUMMARY
+          echo "| --- | ----- |"               | tee -a $GITHUB_STEP_SUMMARY
+          echo "| Namespace    | \`$NAMESPACE\` |"    | tee -a $GITHUB_STEP_SUMMARY
+          echo "| JIRA Ticket  | \`$JIRA\` |"         | tee -a $GITHUB_STEP_SUMMARY
+          echo "| Image Tag    | \`${{ needs.extract-pr-info.outputs.image-tag }}\` |" | tee -a $GITHUB_STEP_SUMMARY
+          echo ""                              | tee -a $GITHUB_STEP_SUMMARY
+          echo "#### Endpoints"                | tee -a $GITHUB_STEP_SUMMARY
+          echo "- UI:         ${BASE}/ui"      | tee -a $GITHUB_STEP_SUMMARY
+          echo "- API:        ${BASE}/api"     | tee -a $GITHUB_STEP_SUMMARY
+          echo "- Public API: ${BASE}/cloudapi/v4" | tee -a $GITHUB_STEP_SUMMARY
+          echo "- Fleet Mgr:  ${BASE}/fm"      | tee -a $GITHUB_STEP_SUMMARY
+          echo "- Grafana:    ${BASE}/grafana" | tee -a $GITHUB_STEP_SUMMARY
+
+      # Post a comment on the PR so developers see the URLs immediately.
+      # Uses actions/github-script — pinned to v7 SHA.
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
+        name: Comment PR with endpoints
+        with:
+          script: |
+            const jira      = "${{ needs.extract-pr-info.outputs.jira-ticket }}";
+            const namespace = "${{ needs.extract-pr-info.outputs.namespace }}";
+            const imageTag  = "${{ needs.extract-pr-info.outputs.image-tag }}";
+            const base      = `https://pr-testing.sandbox.nonprod-project-avengers.com/${jira}`;
+
+            // Find and update an existing bot comment instead of spamming a new one on every push.
+            const marker = "<!-- pr-namespace-deploy -->";
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+
+            const body = `${marker}
+            ## 🚀 PR Environment Deployed
+
+            | Key | Value |
+            | --- | ----- |
+            | **Namespace** | \`${namespace}\` |
+            | **Image Tag** | \`${imageTag.substring(0,7)}\` |
+            | **TTL** | 48 hours from last push |
+
+            ### Endpoints
+            | Service | URL |
+            | ------- | --- |
+            | UI | [${base}/ui](${base}/ui) |
+            | API | [${base}/api](${base}/api) |
+            | Public API (v4) | [${base}/cloudapi/v4](${base}/cloudapi/v4) |
+            | Fleet Manager | [${base}/fm](${base}/fm) |
+            | Grafana | [${base}/grafana](${base}/grafana) |
+
+            > Last deployed: ${new Date().toUTCString()}
+            `;
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  # ─────────────────────────────────────────────────────────────────
+  # Notify Slack on any job failure.
+  # Mirrors: notify-on-failure in sandbox workflow exactly.
+  # ─────────────────────────────────────────────────────────────────
+  notify-on-failure:
+    needs:
+      - extract-pr-info
+      - create-namespace
+      - deploy-data
+      - deploy-applications
+    runs-on: general-small
+    if: ${{ failure() }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/slack-notify-workflow-failure
+        with:
+          workflow-name: "PR Namespace Deploy"
+          cloud-id: ${{ needs.extract-pr-info.outputs.namespace }}
+          jobs: |
+            [
+              {"id": "create-namespace",    "name": "Create Namespace"},
+              {"id": "deploy-data",         "name": "Deploy Data Services"},
+              {"id": "deploy-applications", "name": "Deploy Applications"}
+            ]
+          job-statuses: ${{ toJSON(needs) }}
+          branch: ${{ github.head_ref }}
+          image-tag: ${{ needs.extract-pr-info.outputs.image-tag }}
+          actor: ${{ github.actor }}
